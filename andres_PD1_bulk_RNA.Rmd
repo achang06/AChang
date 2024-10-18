@@ -1,0 +1,2042 @@
+---
+title: "andres-PD1_bulkRNA"
+author: "Adam Pelletier"
+date: "8/25/2021"
+output: html_document
+---
+
+
+```{r setup, message = FALSE, warning=FALSE}
+#### Load required packages for analysis
+## Some packages may require installation from Bioconductor : "https://bioconductor.org/install/" 
+suppressPackageStartupMessages(library(rstudioapi))
+suppressPackageStartupMessages(library(rmarkdown))
+suppressPackageStartupMessages(library(tidyverse))
+suppressPackageStartupMessages(library(readxl))
+suppressPackageStartupMessages(library(ComplexHeatmap))
+suppressPackageStartupMessages(library(DESeq2))
+suppressPackageStartupMessages(library(data.table))
+suppressPackageStartupMessages(library(biomaRt))
+suppressPackageStartupMessages(library(RColorBrewer))
+suppressPackageStartupMessages(library(PCAtools))
+suppressPackageStartupMessages(library(pvca))
+suppressPackageStartupMessages(library(GGally))
+suppressPackageStartupMessages(library(fgsea))
+suppressPackageStartupMessages(library(GSEABase))
+suppressPackageStartupMessages(library(igraph))
+suppressPackageStartupMessages(library(GSVA))
+suppressPackageStartupMessages(library(limma))
+suppressPackageStartupMessages(library(Hmisc))
+suppressPackageStartupMessages(library(sva))
+library(cowplot)
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(getwd())
+```
+
+
+``` {r dirSetup}
+setup_dir <- function(dir_string) { 
+  ### Verifies creates a directory if it doesn't exist. Returns the dir_path
+  if (dir.exists(dir_string)){
+    dir_set <- dir_string
+  } else {
+    dir.create(dir_string) 
+    dir_set <- dir_string
+  }
+  return(dir_set)
+}
+
+inputDir <- setup_dir("input")
+countDir <- setup_dir("input/readCounts/")
+filenameDir <- setup_dir("input/filenameSchema")
+genesetsDir <- setup_dir("input/genesets")
+
+
+outputDir <- setup_dir("output")
+figureDir <- setup_dir(file.path(outputDir,"figures"))
+dataOutDir <- setup_dir(file.path(outputDir,"data"))
+
+
+```
+
+
+```{r pData}
+pData <- read.table(file = file.path(inputDir, "metadata/metadata_2groups.csv"), sep = ";", 
+                        header = T) %>%
+              mutate(condition = gsub(" ", "_", Condition)) %>%
+              mutate(condition = gsub("-", ".", condition)) %>%
+              mutate(condition = factor(condition)) %>%
+              mutate(Patient_ID = factor(Patient_ID)) %>%
+              column_to_rownames("file_id")
+
+
+
+```
+
+
+```{r read counts}
+
+
+file_list_raw <- list.files("input/counts", pattern = "counts_gene", recursive = TRUE,
+                            full.names = TRUE)
+
+
+countLS <- lapply(1:length(file_list_raw), function(x){
+  filename <- gsub(".*/", "", file_list_raw[[x]])
+  filename <- gsub("_counts_gene", "", filename)
+  
+  # ref_filename <- unique(rename_file[rename_file$sampleNumber== filename,]$SampleID)
+  # print(ref_filename)
+  df <- read.table(file_list_raw[[x]]) %>%
+        dplyr::rename(EnsID = "V1") %>%
+        gather(file, count, -EnsID) %>%
+        mutate(file = filename)
+  
+  return(df)
+}) 
+
+
+countMat <- do.call("rbind", countLS) %>%
+            spread(file,count) 
+            
+countMat <- countMat[,c("EnsID", row.names(pData))]
+write.table(countMat, file = file.path(countDir,"readCounts_high_vs_neg_PD1.txt"), sep = "\t", 
+            row.names = FALSE,
+            quote = FALSE)
+```
+
+```{r ensID biomart}
+ensembl <- useMart("ensembl", dataset="hsapiens_gene_ensembl")
+symbolConv <- getBM(attributes= c("ensembl_gene_id","hgnc_symbol", "description"),
+                      filters = 'ensembl_gene_id', values =countMat$EnsID, mart = ensembl)
+
+gene_length <- getBM(attributes= c("ensembl_gene_id", "transcript_length", "chromosome_name", "start_position", "end_position"),
+                      filters = 'ensembl_gene_id', values =countMat$EnsID, mart = ensembl)
+
+
+average_gene_length <- symbolConv %>%
+                      inner_join(., gene_length, by = "ensembl_gene_id") %>%
+                      group_by(hgnc_symbol) %>%
+                      summarise(seqlength = mean(transcript_length),
+                                chr = chromosome_name,
+                                start = min(start_position), 
+                                end = max(end_position)) %>%
+                      ungroup() %>%
+                      filter(hgnc_symbol != "") %>%
+                      unique() %>%
+                      mutate(chr = paste("chr",chr, sep = ""))
+average_gene_length <- average_gene_length[match(row.names(dds), average_gene_length$hgnc_symbol),]
+
+
+
+```
+
+
+```{r annotate_genes}
+count_matrix <- countMat %>%
+                gather(sample, count, -EnsID) %>%
+                inner_join(., symbolConv, by = c("EnsID" = "ensembl_gene_id")) %>%
+                filter(hgnc_symbol != "") %>%
+                group_by(sample, hgnc_symbol) %>%
+                summarise(sum = sum(count)) %>%
+                ungroup() %>%
+                spread(sample, sum, fill = 0) %>%
+                column_to_rownames("hgnc_symbol")
+
+
+
+```
+
+
+```{r deseq2}
+dds <- DESeqDataSetFromMatrix(colData = pData,   # dataset HTS-Seq, with associated conditions
+                              countData = count_matrix[,rownames(pData)],
+                              design= ~ Patient_ID + condition )
+
+
+
+keep <- rowSums(counts(dds)) >= 10  # discard genes with less than 10 reads: low quality filtering
+dds <- dds[keep,]
+dds <- DESeq(dds, betaPrior = FALSE, test="LRT",reduced = ~ 1)
+rld <- rlog(dds, blind=TRUE)
+
+
+dds_fpkm <- dds
+len_grange <- as(average_gene_length, "GRanges")
+
+
+rowRanges(dds_fpkm) <- len_grange
+
+topTables <- list()
+
+topTables$fullModel <- results(dds)
+
+
+eset_rld <- ExpressionSet(assayData = assay(rld),
+                          phenoData = AnnotatedDataFrame(pData))
+
+
+
+fpkm_mat <- fpkm(dds_fpkm)
+row.names(fpkm_mat) <- row.names(eset_rld)
+
+```
+
+
+```{r PVCA}
+
+
+pvca_func <- function(eset, batch.factors, threshold, inter = T){
+  require(lme4)
+  require(pvca)
+  pvca <- pvca::PVCA(exprs(eset), meta = pData(eset)[,batch.factors], threshold = threshold, inter= inter)
+  #return(pvca)
+  #return(pvca)
+  df <-  as.data.frame(pvca) %>% 
+          rownames_to_column("batch") %>%
+          dplyr::rename(Prop_var = 2) %>%
+          arrange(desc(Prop_var))
+  print(df)
+  p <- ggplot(df, aes(x = reorder(batch,Prop_var), y = Prop_var)) +
+    geom_bar(stat = "identity") +
+    labs(x = "Condition",
+         y = "Weighted average proportion variance") +
+    theme_bw() +
+    coord_flip()
+  out <- list("results" = df, "plot" = p)
+  return(out)
+}
+
+
+#Perform PVCA on all samples
+pvca_all <- pvca_func(eset_rld,batch.factors = c( "condition", "Patient_ID", "Gender", "IGHV" ), 
+                      threshold = 0.1, inter = F )
+
+pdf(file = file.path(figureDir, "pvca_PD1.pdf"))
+pvca_all$plot
+
+dev.off()
+
+
+pvca_patient_corrected <- pvca_func(eset_rld_combat,batch.factors = c( "condition", "Patient_ID", "Gender", "IGHV" ), 
+                      threshold = 0.1, inter = F )
+
+pdf(file = file.path(figureDir, "pvca_PD1_corrected.pdf"))
+pvca_patient_corrected$plot
+dev.off()
+
+```
+
+
+```{r PCA}
+
+
+dds_to_eset <- function(dds, fData = NULL){
+  if(!is.null(fData)){
+    eset <- ExpressionSet(assayData = assay(dds),
+                          phenoData = AnnotatedDataFrame(as.data.frame(colData(dds))),
+                          featureData = AnnotatedDataFrame(fData))
+  } else{
+     eset <- ExpressionSet(assayData = assay(dds),
+                          phenoData = AnnotatedDataFrame(as.data.frame(colData(dds))))
+  }
+ 
+  return(eset)
+  
+}
+
+pca_func <- function(object, scale = T, ntop = NULL){
+  if(class(object) ==  "DESeqTransform"){
+    eset <- dds_to_eset(object)
+  } else if(class(object) == "ExpressionSet"){
+    eset <- object
+  } else {
+    stop("Invalid object.")
+  }
+  
+  if(!is.null(ntop)){
+    rv <- rowVars(exprs(eset))
+    select <- order(rv, decreasing = TRUE)[seq_len(min(ntop, 
+          length(rv)))]
+    mat <- t(exprs(eset)[select,])
+   
+  } else {
+      mat <- t(exprs(eset))
+  }
+  
+  pca <- summary(prcomp(mat, scale. = scale))
+  
+  importance <- pca$importance 
+  importance_df <- t(importance) %>%
+                    as.data.frame() %>%
+                    rownames_to_column("PC") 
+  
+  elbow <- findElbowPoint(importance_df$`Standard deviation`^2)
+  #elbow <- colnames(importance)[findElbowPoint(importance_df$`Standard deviation`^2)]
+  
+  #elbowPC <- colnames(importance)[]
+  
+  holm <- parallelPCA(mat)$n
+  
+  scree <- ggplot(importance_df, aes(x = reorder(PC,-`Proportion of Variance`) , y = `Proportion of Variance` )) + 
+            geom_bar(stat = "identity") +
+            geom_point(data = importance_df, aes(x = reorder(PC,-`Proportion of Variance`), 
+                                                 y = `Cumulative Proportion`),
+                       size = 0.5) +
+            stat_smooth(data = importance_df, aes(x = reorder(PC,-`Proportion of Variance`), 
+                                                 y = `Cumulative Proportion`), method = "loess") + 
+            #geom_smooth(data = importance_df, aes)
+            geom_vline(xintercept =  elbow, linetype = "dashed") + 
+            geom_vline(xintercept =  holm, linetype = "dashed") + 
+            geom_text(aes(elbow - 2, 0.75, label = "Elbow", vjust = -1)) + 
+            geom_text(aes(holm + 2, 0.75, label = "Holm", vjust = -1)) + 
+            theme_bw() +
+            theme(axis.text.x = element_text(angle = 90 ))
+  
+  
+
+  pca_df <- pca$x %>%
+            as.data.frame() %>%
+            rownames_to_column("SampleID") %>%
+            inner_join(., pData(eset) %>% rownames_to_column("SampleID"), by  = "SampleID") %>%
+            dplyr::select(colnames(pca$x), SampleID, everything())
+  
+  out <- list("pca_df" = pca_df, "importance" = importance, "scree" = scree, "loadings" = pca$rotation)
+
+  return(out)
+}
+
+#aes_string(color = color, fill = fill, shape = shape, size = size)
+pca_plot_func <- function(pca_object, dims = c(1:2), color = NULL,  fill = NULL,  shape = NULL, size = NULL, geom_size = 0.5,
+                          color_vector = NULL, fill_vector = NULL, shape_vector = NULL, size_limits = NULL){
+    dim_len <- seq(dims)
+    combn_dims <- combn(dim_len, m = 2, simplify = F)
+    importance <- as.data.frame(pca_object$importance)
+    
+    out <- lapply(combn_dims, function(x){
+      var1 <- colnames(pca_object$pca_df)[x[1]]
+      var2 <- colnames(pca_object$pca_df)[x[2]]
+      p <- ggplot(pca_object$pca_df, aes_string(x = var1, y = var2)) 
+      if(!is.null(size)){
+      p <- p + geom_point(aes_string(color = color, fill = fill, shape = shape, size = size))
+      } else {
+      p <- p + geom_point(size = geom_size, aes_string(color = color, fill = fill, shape = shape))
+      }
+      p <- p + 
+            theme_bw() + 
+            xlab(label = paste(var1 ,  " (", signif(importance[[var1]][2] *100, 4), "%) ", sep = "")) +
+            ylab(label = paste(var2 ,  " (", signif(importance[[var2]][2] *100, 4), "%) ", sep = "")) 
+
+      if(!is.null(fill_vector)){
+      p <- p + scale_fill_manual(values = fill_vector)
+      }
+      if(!is.null(color_vector)){
+      p <- p + scale_color_manual(values = color_vector)
+      }
+      if(!is.null(shape_vector)){
+      p <- p + scale_shape_manual(values = shape_vector) +
+                guides(fill = guide_legend(override.aes=list(shape=21)))
+      }
+      if(!is.null(size_limits)){
+      p <- p + scale_size_continuous(limits = size_limits)
+      }
+      return(p)
+    })
+    
+  
+    
+}
+
+
+pca_pairplot <- function(pca_object, dims = c(1:3), color  = "condition" ){
+  
+  pca_df <- pca_object$pca_df
+  p <- ggpairs(data = pca_df, columns = dims, aes_string(colour = color), 
+             showStrips = F,
+             upper = list(continuous = "blank", combo = "blank"),
+             lower = list(combo = wrap("box_no_facet", alpha=1), continous = "points"),
+             diag = list(discrete = "blankDiag"),
+             legend = 1,
+             cardinality_threshold = length(unique(pca_df[[color]])),
+             switch = "y") +
+             theme_bw()
+  return(p)
+  
+}
+
+loadingScorePlot <- function(pca_object, dims = c(1:3), fData, pct.filt = 0.0005, top = NULL, loadSelect = "all"){
+  pc_select <- colnames(pca_object$loadings)[dims]
+  df <- pca_object$loadings %>%
+        as.data.frame() %>%
+        rownames_to_column("GeneID") %>%
+        gather(PC, value, -GeneID ) %>%
+        filter(PC %in% pc_select) %>%
+        mutate(PC = factor(PC, levels = pc_select))  %>%
+        inner_join(., fData %>% rownames_to_column("GeneID"), by = "GeneID") #%>%
+         #
+  
+  if(loadSelect == "all"){
+    df <- df %>% 
+         group_by(PC) %>%
+         mutate(abs_load = abs(value)) %>%
+         mutate(rank = rank(-abs_load)) %>%
+         mutate(quantile = ntile(abs_load, n = 1000)) %>%
+         ungroup() 
+  } else if(loadSelect == "pos"){
+     df <- df %>% 
+         filter(value > 0) %>%
+         group_by(PC) %>%
+         mutate(load = value) %>%
+         mutate(rank = rank(-load)) %>%
+         mutate(quantile = ntile(load, n = 1000)) %>%
+         ungroup() 
+  } else if(loadSelect == "neg"){
+     df <- df %>% 
+         filter(value < 0) %>%
+         group_by(PC) %>%
+         mutate(load = value) %>%
+         mutate(rank = rank(load)) %>%
+         mutate(quantile = ntile(-load, n = 1000)) %>%
+         ungroup() 
+  }
+
+  if(!is.null(top)){
+    df_filt <- df %>% filter(rank <= top)
+  } else {
+    df_filt <-  df %>% filter(quantile >= (1-pct.filt) * 1000)
+  }
+  
+  p <- ggplot(df_filt, aes(x = PC, y = load, color = load ) ) + 
+        geom_point(size = 3) + 
+        geom_label_repel(aes(label = Gene)) + 
+        theme_bw()
+  out <- list("plot" = p, "topFeatures" = split(df_filt, f  = df_filt$PC))
+  return(out)
+}
+#test <- eset_rld[,eset_rld$Organ == "spleen"]
+
+
+```
+
+
+```{r pca}
+
+
+color_annots <- c("PD-1 negative" = "#3953A2",
+                  "PD-1 high" = "#FF0000")
+
+pca_all <- pca_func(object = eset_rld)
+
+pca_plot <- pca_plot_func(pca_all, color = "FISH", shape = "condition", size = 3)
+
+pdf(file.path(figureDir, "pca_PD1_FISH_condition.pdf"))
+pca_plot
+dev.off()
+
+pca_plot_sex <- pca_plot_func(pca_all, color = "FISH", shape = "Gender", size = 3)
+
+pdf(file.path(figureDir, "pca_PD1_FISH_sex.pdf"))
+pca_plot_sex
+dev.off()
+
+pca_plot_patient <- pca_plot_func(pca_all, color = "Patient_ID", shape = "condition", size = 3)
+
+pdf(file.path(figureDir, "pca_PD1_patient_condition.pdf"))
+pca_plot_patient
+dev.off()
+
+
+
+
+
+pca_all_final <- ggplot(pca_corr$pca_df, aes(x = PC1, y = PC2, fill = Condition)) +
+          #geom_point(size = 4) +
+          geom_point(size = 4, shape = 22) +
+          theme_bw() +
+          scale_fill_manual(values=color_annots) +
+           xlab(label = paste("PC1" ,  " (", signif(as.data.frame(pca_corr$importance)$PC1[2] *100, 4), "%) ", sep = "")) +
+          ylab(label = paste("PC2" ,  " (", signif(as.data.frame(pca_corr$importance)$PC2[2] *100, 4), "%) ", sep = "")) 
+
+pdf(file.path(figureDir, "pca_PD1_condition_batch_corrected.pdf"), width = 7, height = 5)
+pca_all_final
+dev.off()
+
+pca_corr <- pca_func(object = eset_rld_combat)
+
+pca_plot_corr <- pca_plot_func(pca_corr, color = "FISH", shape = "condition", size = 3)
+
+pca_plot_corr
+
+
+
+```
+
+
+```{r DEG_heatmap_func}
+
+colorAssign <- function(valueVector, scale_limits = NULL, colors = c("blue", "white", "red"), length.vector = 500){
+  colorLS <- colorRampPalette(colors = colors)(length.vector)  
+  if(is.null(scale_limits)){
+    breaks <- seq(-max(abs(valueVector)), max(abs(valueVector)), length.out = length.vector)
+  } else {
+    breaks <- seq(scale_limits[1], scale_limits[2], length.out = length.vector)
+  }
+  
+  
+  minBreak <- which(abs(breaks - min(valueVector)) == min(abs(breaks - min(valueVector))))
+  maxBreak <- which(abs(breaks - max(valueVector)) == min(abs(breaks - max(valueVector))))
+  return(colorLS[minBreak:maxBreak])
+}
+
+# test <- seq(-3,5, length.out =  100)
+# test2 <- colorAssign(valueVector = test)
+
+
+DEG_heatmap <- function(eset, heatmap_attributes = NULL, colors = c("blue", "white", "red"), scale = T){
+    if(scale){
+       mat_scaled <- t(scale(t(exprs(eset)), center = T, scale = T))
+       colorLS <- colorAssign(colors = colors, valueVector = mat_scaled)
+    } else {
+      mat_scaled <- exprs(eset)
+      colorLS <- colorRampPalette(rev(brewer.pal(n = 7, name = "RdYlBu")))(100)
+    }
+   
+  
+    params <- list(mat = mat_scaled,
+                   scale = "none",
+                   color = colorLS,
+                   clustering_method  = "ward.D2")
+    
+    
+    if(!is.null(heatmap_attributes)){
+      params <- modifyList(params, heatmap_attributes, keep.null = T)
+    }
+
+    p <- do.call("pheatmap", params)            
+                   
+    return(p)
+    # p <- pheatmap(mat = exprs(eset),
+    #               )
+  
+}
+
+
+```
+
+```{r diff_expr }
+deseq_analysis <- function(deseqObj, contrast_name, contrast_group, ctrl_group, rldcheck= TRUE){
+  dds <- deseqObj
+  keep <- rowSums(counts(dds)) >= 10  # discard genes with less than 10 reads: low quality filtering
+  dds <- dds[keep,]
+  dds$condition <- relevel(dds$condition, ref = ctrl_group)  # group low defined as the control here.
+  dds <- DESeq(dds, test = "Wald")
+  
+  out <- list()
+  if(rldcheck == TRUE){
+    out$rld <- rlog(dds, blind=FALSE) #Regularized Log transformation of the data for clustering (PCA, heatmap)
+  }
+  out$res <- results(dds,contrast=c("condition",contrast_group,ctrl_group))
+  coefN <- which(resultsNames(dds) == paste("condition_",contrast_group, "_vs_", ctrl_group, sep = "" ))
+  #res_LFC <- lfcShrink(dds, contrast=c("condition",contrast_group,ctrl_group), type = "apeglm")
+  res_LFC <- lfcShrink(dds, coef = coefN, type = "apeglm")
+  out$res_LFC <- res_LFC[!is.na(res_LFC$padj),]
+  out$contrastVar <- contrast_name
+  out$contrastGroups <- c(contrast_group,ctrl_group)
+  out$sampleIDs <- colnames(dds[,colData(dds)[[contrast_name]] %in% c(contrast_group,ctrl_group)])
+  return(out)
+}  
+
+```
+
+
+```{r deseq contrast}
+
+topTables_constrasts <- list()
+topTables_constrasts$`PD-1_high_vs_PD-1_negative` <-  deseq_analysis(dds, 
+                                                        contrast_name = "condition_PD.1_negative_vs_PD.1_high",
+                                                          contrast_group = "PD.1_high",
+                                                          ctrl_group = "PD.1_negative",
+                                                          rldcheck = F)
+writexl::write_xlsx(topTables_constrasts$`PD-1_high_vs_PD-1_negative`$res_LFC %>%
+                      as.data.frame() %>%
+                      rownames_to_column("hgnc_symbol") %>%
+                      inner_join(., symbolConv %>% dplyr::select(hgnc_symbol, description), 
+                                 by = "hgnc_symbol") %>%
+                      mutate(enrichedIn = ifelse(log2FoldChange > 0, "PD1_high", "PD1_low")) %>%
+                      mutate(enrichedIn = ifelse(padj > 0.05 | is.na(padj), "--", enrichedIn)) %>%
+                      arrange(desc(abs(log2FoldChange))) %>% 
+                      mutate(significant = ifelse(abs(log2FoldChange) > log2(1.25), "YES", "NO")),
+                    path = file.path(dataOutDir, "PD1high_vs_PD1neg_DEG_table_shrunked.xlsx"))
+
+
+writexl::write_xlsx(topTables_constrasts$`PD-1_high_vs_PD-1_negative`$res %>%
+                      as.data.frame() %>%
+                      rownames_to_column("hgnc_symbol") %>%
+                      inner_join(., symbolConv %>% dplyr::select(hgnc_symbol, description), 
+                                 by = "hgnc_symbol") %>%
+                      mutate(enrichedIn = ifelse(log2FoldChange > 0, "PD1_high", "PD1_low")) %>%
+                      mutate(enrichedIn = ifelse(padj > 0.05 | is.na(padj), "--", enrichedIn)) %>%
+                      arrange(desc(abs(log2FoldChange))) %>% 
+                      mutate(significant = ifelse(abs(log2FoldChange) > log2(1.25), "YES", "NO")),
+                    path = file.path(dataOutDir, "PD1high_vs_PD1neg_DEG_table_normal.xlsx"))
+
+
+validation_markers <- readxl::read_excel("input/201214 CLL stain validation.xlsx", sheet = "Sheet3") %>%
+                      dplyr::rename(marker = 1) %>%
+                      .$marker
+
+qc_marker_boxplots <- sapply(intersect(validation_markers,row.names(eset_rld)), simplify = F, 
+                             USE.NAMES = T, function(x){
+   p <- as.data.frame(exprs(eset_rld[x,])) %>%
+                  rownames_to_column("Gene") %>%
+                  gather(Sample, rlog, -Gene) %>%
+                  inner_join(., pData(eset_rld) %>% rownames_to_column("Sample"), by = "Sample") %>%
+                  mutate(Condition = factor(Condition , levels = c("PD-1 negative", "PD-1 high"))) %>%
+                  ggplot(., aes(x = Condition, y = rlog)) +
+                  geom_boxplot() +
+                  geom_point(size = 2, aes(color = Patient_ID)) +
+                  geom_line(color = "gray", aes(group = Patient_ID)) +
+                  theme_classic() +
+                  ylab("Regularized Log expression") +
+                  xlab("Sorted subset") +
+                  ggtitle(paste(x," expression", sep = ""))
+})
+
+lapply(names(qc_marker_boxplots), function(x){
+  svg(file.path(figureDir, paste("qc_marker_expression_boxplots_",x ,".svg")))
+  print(qc_marker_boxplots[[x]])
+  dev.off()
+  
+})
+
+
+```
+
+
+```{r volcano}
+
+volcano_df_annot_andres <- read_excel(path = "output/data/PD1high_vs_PD1neg_DEG_table_normal volc plot label.xlsx") %>%
+                            dplyr::select(hgnc_symbol, `Volc plot`)
+  
+volcano_df <- read_excel(path = "output/data/PD1high_vs_PD1neg_DEG_table_shrunked.xlsx") %>%
+            as.data.frame() %>%
+            #rownames_to_column("gene") %>%
+            filter(!is.na(padj) ) %>%
+            mutate(significant = ifelse(padj < 0.05, 1, 0)) %>%
+            # mutate(direction = ifelse(significant == 1 & log2FoldChange > log2(1.25), "UP", "Not significant")) %>%
+            # mutate(direction = ifelse(significant == 1 & log2FoldChange < -log2(1.25), "DOWN", direction )) %>%
+             mutate(direction = ifelse(significant == 1 & log2FoldChange > 0, "UP", "Not significant")) %>%
+            mutate(direction = ifelse(significant == 1 & log2FoldChange < 0, "DOWN", direction )) %>%
+            mutate(logp = -log10(padj)) %>%
+            left_join(volcano_df_annot_andres, by = "hgnc_symbol")
+
+writexl::write_xlsx(volcano_df[volcano_df$direction != "Not significant",], path = "output/data/PD1high_vs_PD1neg_DEGtable_shrunk_annotated.xlsx")
+
+
+volcano_select <- c("MKI7", "CD5", "PDCD1", "CXCR4", "BACH2", "TLR9", "BIRC5", "MYCN", "CD1C", "SMAD4", "SMAD3", "TGFBR1", "TGFBR2", "PAX5", "MKI67", "CDKN1A")
+volcano_labels <- volcano_df %>%
+                  dplyr::filter(hgnc_symbol %in% volcano_select)
+                  #filter(`Volc plot` %in% c("Yes", "Maybe"))
+                  #filter(`Volc plot` %in% c("Yes"))
+
+
+
+ volcano_p <- ggplot(volcano_df, aes(x = log2FoldChange, y = logp, color = direction )) +
+                geom_point(size = 0.5) +
+                theme_classic() +
+                ylab("-log10(p')") +
+                geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "gray") +
+                #geom_vline(xintercept = log2(1.25),linetype = "dashed", color = "gray") +
+                #geom_vline(xintercept = -log2(1.25), linetype = "dashed", color = "gray") +
+                xlim(c(-7.5,max(abs(volcano_df$log2FoldChange)) +1 ) ) +
+                geom_label_repel(aes(label = hgnc_symbol, color = direction), size = 3, data = volcano_labels, max.overlaps = 30) +
+                scale_color_manual(values=c('blue','black', 'red'))   
+
+ svg("output/figures/volcano_plot_DEGs.svg", width = 5, height = 4.5)
+ print(volcano_p)
+ dev.off()
+ 
+ 
+  pdf("output/figures/volcano_plot_DEGs.pdf", width = 5, height = 4.5)
+ print(volcano_p)
+ dev.off()
+ 
+ 
+#  
+volcano_marks <- volcano_df %>%
+                  filter(direction %in% c("UP", "DOWN")) %>%
+                  #mutate(mark = ifelse(`Volc plot` %in% c("Yes", "Maybe"), hgnc_symbol, "" )) %>%
+                  mutate(mark = ifelse(`Volc plot` %in% c("Yes"), hgnc_symbol, "" )) %>%
+                  mutate(rowid = row_number())
+# 
+
+```
+
+
+```{r DEG_heatmap}
+
+genes <- topTables_constrasts$`PD-1_high_vs_PD-1_negative`$res_LFC %>%
+            as.data.frame() %>%
+            rownames_to_column("gene") %>%
+            filter(!is.na(padj) ) %>%
+            filter(padj < 0.05) %>%
+            #filter(abs(log2FoldChange) > 1.25) %>%
+            .$gene
+
+annot_hm_rownames <- as.data.frame(data.frame("genes" = genes)) %>%
+              mutate(genes = as.character(genes)) %>%
+              mutate(rowname_custom = ifelse(genes %in% c("PDCD1", "HAVCR2", "LAG3", "STAT4", "TIGIT", "SMAD4", "SMAD3", "TGFBR1", "TGFBR2", "PAX5"), 
+                                             genes, ""))%>%
+              column_to_rownames("genes")
+
+
+
+
+
+DEG_hm <- DEG_heatmap(eset_rld[volcano_df[volcano_df$significant,],], 
+                    heatmap_attributes = list(annotation_col = pData(eset_rld)[c("condition",
+                                                                            "FISH", "IGHV")],
+                                              labels_row = annot_hm_rownames$rowname_custom,
+                                        show_rownames = T,
+                                        show_colnames = F,
+                                        cutree_cols = 2,
+                                        cutree_rows = 2,
+                                        filename = file.path(figureDir, "DEG_heatmap_padj_0.01_LFC_1.5.pdf")))
+
+
+# volcano_df <- topTables_constrasts$`PD-1_high_vs_PD-1_negative`$res_LFC %>%
+#             as.data.frame() %>%
+#             rownames_to_column("gene") %>%
+#             filter(!is.na(padj) ) %>%
+#             mutate(significant = ifelse(padj < 0.05, 1, 0)) %>%
+#             mutate(direction = ifelse(significant == 1 & log2FoldChange > log2(1.5), "UP", "Not significant")) %>%
+#             mutate(direction = ifelse(significant == 1 & log2FoldChange < -log2(1.5), "DOWN", direction )) %>%
+#             mutate(logp = -log10(padj)) 
+
+
+
+
+
+
+generate_Annot <- function(dataframe, columns, colors, annotParams = NULL){
+  annot <- list()
+  colLS <- list()
+  nlevels <- 0
+  colorIndex <- 1
+  for(i in columns){
+    annot[[i]] <- as.character(dataframe[[i]])
+    color_names <- levels(factor(dataframe[[i]]))
+    color_vec <- colors[colorIndex:(colorIndex+length(color_names)-1)]
+    names(color_vec) <- color_names
+    colorIndex <- colorIndex +length(color_vec)
+    colLS[[i]] <- color_vec
+    print(color_vec)
+  }
+  annot[["col"]] <- colLS
+  #return(annot)
+   if(!is.null(annotParams)){
+      annot <- modifyList(annot, annotParams, keep.null = T)
+    }
+ out <- do.call("HeatmapAnnotation", annot)
+  
+}
+
+
+hac <-  generate_Annot(pData(eset_rld_combat) %>%
+                              mutate(Condition = as.character(Condition)) %>%
+                              mutate(Condition = factor(Condition, levels = c("PD-1 high", "PD-1 negative"))), 
+                            columns = c("Condition" ), 
+                            colors = c(color_annots[2], color_annots[1]), 
+                            annotParams = list(annotation_legend_param = list(
+                              Condition = list(direction = "horizontal",nrow = 2,
+                                          border = "gray"))))
+
+selected_degs <- c("MKI67", "CD5", "PDCD1", "CXCR4", "CD27", 'BACH2', "CCL5", "CCL4", "CCL3", "LAG3", "CXCR3", "FcRL1", "TLR9",
+                "CD85K", "IL6R", "BIRC5", "MYCN", "CD1C", "LILRB4", "MAPK3", "MAP2K3", "CDKN2A", "CDKN1A", "CDK4", "SMAD3", "PAX5", "SMAD4", "TGFBR1", "TGFBR2")
+
+volcano_marks_filt <- volcano_marks %>%
+                      mutate(mark = ifelse(hgnc_symbol %in% selected_degs, hgnc_symbol, ""))
+
+# ha = rowAnnotation(foo = anno_mark(at = volcano_marks[volcano_marks$mark != "",]$rowid, labels = volcano_marks[volcano_marks$mark != "",]$mark),
+#                    gp = gpar(fontsize = 2))
+ha = rowAnnotation(foo = anno_mark(at = volcano_marks_filt[volcano_marks_filt$mark != "",]$rowid, labels = volcano_marks_filt[volcano_marks_filt$mark != "",]$mark),
+                   gp = gpar(fontsize = 2))
+
+hm_mat_deg <- t(scale(t(exprs(eset_rld_combat)[volcano_marks_filt$hgnc_symbol,])))
+hc <- hclust(dist(t(hm_mat_deg), method = "euclidean"), method = "ward.D2")
+dend <- as.dendrogram(hc)
+
+deg_cHeatmap <- Heatmap(hm_mat_deg, name = "Z-score", cluster_rows = T, right_annotation = ha,
+                        cluster_columns = hc,
+    show_row_names = F, show_column_names = F, heatmap_height = unit(20, "cm"), column_split = 2, row_split = 2, 
+    top_annotation = hac, 
+    color_space = "RGB")
+
+svg("output/figures/deg_heatmap_annot.svg", width = 7, height = 10)
+draw(deg_cHeatmap)
+dev.off()
+
+pdf("output/figures/deg_heatmap_annot.pdf", width = 7, height = 10)
+draw(deg_cHeatmap)
+dev.off()
+
+
+DEG_LS <- list()
+DEG_LS$PD1_high_Pre_treatment <- volcano_df[volcano_df$direction == "UP",]$hgnc_symbol
+DEG_LS$PD1_low_Pre_treatment <- volcano_df[volcano_df$direction == "DOWN",]$hgnc_symbol
+```
+
+
+
+```{r fgsea_func}
+
+
+
+fgsea_function <- function(x,gmtfile, method = "shLFC", p_thr = 0.05, n.perm = 10000, maxSize = 5000, minSize = 15) {
+  ###function to do preranked geneset enrichment using fgsea using a given 1.srunken deseq input and 2.gmt file path
+  if(!method %in% c("shLFC","logp", "regression")){
+    stop("Invalid method for fgsea_function. Options are 'shLFC' or 'logp'")
+  }
+  shrunk_deseq_output <- x
+  shrunk_deseq_output <- shrunk_deseq_output[!is.na(shrunk_deseq_output$padj),]
+  if( method == "shLFC"){
+      #shrunk_deseq_output <- shrunk_deseq_output[order(-shrunk_deseq_output$log2FoldChange),] 
+      #ranks <- shrunk_deseq_output
+      ranks_set <- setNames(shrunk_deseq_output$log2FoldChange, row.names(shrunk_deseq_output))
+  } else if(method == "logp") {
+      shrunk_deseq_output$rank_metric <- sign(shrunk_deseq_output$log2FoldChange) *   -log(shrunk_deseq_output$pvalue)
+      shrunk_deseq_output <- shrunk_deseq_output[order(-shrunk_deseq_output$rank_metric),] 
+      ranks <- shrunk_deseq_output
+      ranks_set <- setNames(ranks$rank_metric, row.names(ranks))
+  } else if(method == "regression") {
+    shrunk_deseq_output$rank_metric <- sign(shrunk_deseq_output$log2FoldChange) *   -log(shrunk_deseq_output$pvalue)
+      shrunk_deseq_output <- shrunk_deseq_output[order(-shrunk_deseq_output$rank_metric),] 
+      ranks <- shrunk_deseq_output
+      ranks_set <- setNames(ranks$rank_metric, row.names(ranks))
+  }
+  pathways <- gmtPathways(gmtfile)
+  fgseaRes<-fgsea(pathways,ranks_set,minSize=minSize,maxSize=maxSize,nperm=n.perm)
+  fgseaRes<- fgseaRes[fgseaRes$pval <=p_thr,]
+  fgseaRes<-fgseaRes[order(fgseaRes$padj),]
+  fgseaRes<-fgseaRes[!is.na(fgseaRes$padj),]
+  return(fgseaRes)
+}
+
+fgsea_output <- function(fgsea_vector,
+                         eset_contrast,
+                         outcome,
+                         geneset_list,
+                         geneset,
+                         fileDir,
+                         method = "shLFC",
+                         p_thr = 0.05, 
+                         maxSize = 5000,
+                         minSize = 15,
+                         output = "table") {
+  if(length(fgsea_vector[[outcome]]) == 0) {
+    fgsea_list <- list()
+  } else {
+    fgsea_list <- fgsea_vector[[outcome]]
+  }
+  fgsea_list[[geneset]]$geneset_file <- geneset_list[[geneset]]
+  
+  if(output == "table"){
+    
+  }
+  fgsea_list[[geneset]]$output <- fgsea_function(eset_contrast, 
+                                                 geneset_list[[geneset]], 
+                                                 method = method, 
+                                                 p_thr = p_thr,
+                                                 maxSize = maxSize,
+                                                 minSize = minSize)
+  #write.csv(as.data.frame(fgsea_list[[geneset]]$output[,c(1:7)]), 
+    #      file=file.path(fileDir,paste(outcome,geneset,method,"gsea.csv", sep="_")), 
+        #  quote = FALSE)
+  fgsea_vector[[outcome]] <- fgsea_list
+  return(fgsea_vector)
+}
+
+
+
+
+
+
+
+```
+
+
+```{r fgsea}
+
+GSEA_data_Dir <- setup_dir(file.path(dataOutDir, "gsea") )
+
+
+genesetsDir <- "~/Documents/GMT_files/"
+genesetsDir_msigdb <- "~/Documents/MSigDB/msigdb_v7.2_GMTs/"
+geneset_list <- list(c5 = file.path(genesetsDir_msigdb,
+                                        "c5.go.bp.v7.2.symbols.gmt"),
+                     c2 = file.path(genesetsDir_msigdb,
+                                        "c2.all.v7.2.symbols.gmt"),
+                     c7 = file.path(genesetsDir_msigdb,
+                                        "c7.all.v7.2.symbols.gmt"),
+                     hallmark = file.path(genesetsDir_msigdb,
+                                        "h.all.v7.2.symbols.gmt"),
+                     c3 = file.path(genesetsDir_msigdb,
+                                        "c3.all.v7.2.symbols.gmt"),
+                     transfac = file.path(genesetsDir,
+                                        "TRANSFAC.gmt"),
+                     jasper = file.path(genesetsDir,
+                                        "JASPER-tf.gmt"),
+                     CHEA = file.path(genesetsDir,
+                                        "CHEA-tf.gmt"),
+                     ENCODE = file.path(genesetsDir,
+                                        "ENCODE-tf.gmt"),
+                     GSE21029 = "output/GSE21029_LN_vs_PB_CLL.gmt")
+
+
+fgsea_analysis <- list()
+
+for(i in names(topTables_constrasts)){
+  for(j in names(geneset_list)) {
+    maxSize <- 500
+    minSize <- 15
+    if(j %in% c("CHEA", "transfac", "JASPER", "c3", "ENCODE")){
+      maxSize <- 5000
+    } 
+    topTable <- topTables_constrasts[[i]]$res_LFC
+                  
+                  
+    fgsea_analysis <- fgsea_output(fgsea_analysis,
+                               eset_contrast = topTable,
+                               outcome = i,
+                               geneset_list = geneset_list,
+                               geneset = j,
+                               fileDir = GSEA_data_Dir,
+                               p_thr = 0.1,
+                               method = "shLFC",
+                               minSize = minSize,
+                               maxSize = maxSize)
+    if(dim(fgsea_analysis[[i]][[j]]$output)[1] >0){
+      print(c(i,j,dim(fgsea_analysis[[i]][[j]]$output)[1]))
+    }
+  }
+}                     
+
+
+
+             
+```
+
+
+```{r fgsea_consolidate}
+
+fgsea_consolidated <- do.call("rbind", lapply(names(fgsea_analysis$`PD-1_high_vs_PD-1_negative`), 
+                              function(x){
+    
+          df <- fgsea_analysis$`PD-1_high_vs_PD-1_negative`[[x]]$output %>%
+                mutate(gsColl = x,
+                         condition = "PD-1_high_vs_PD-1_negative") %>%
+                  mutate(Enriched_in = ifelse(NES > 0, "PD-1_high", "PD-1_negative")) %>%
+                  unnest(cols = leadingEdge) %>%
+                  group_by(pathway) %>%
+                  mutate(cLeadingEdge = paste(leadingEdge, collapse = ", ")) %>%
+                  ungroup() %>%
+                  dplyr::select(-leadingEdge) %>%
+                  unique() %>%
+                  dplyr::rename(leadingEdge = cLeadingEdge)
+        return(df)
+    }))
+
+writexl::write_xlsx(split(fgsea_consolidated, f = fgsea_consolidated$gsColl), 
+                    path = file.path(dataOutDir,"gsea_output.xlsx"))
+
+```
+
+
+```{r compare DEG}
+past_analysis <- read_xlsx("input/metadata/highVSneg_FDR0_001.xlsx") %>%
+                  
+                  
+
+  
+new_deg <- as.data.frame(topTables_constrasts$`PD-1_high_vs_PD-1_negative`$res_LFC) %>%
+    rownames_to_column("gene") %>%
+    filter(padj < 0.001) %>%
+    arrange(desc(abs(log2FoldChange)))
+
+intersect_deg <- intersect(past_analysis$...1, new_deg$gene)
+  
+filt_gsea <- fgsea_consolidated %>%
+            filter(grepl("TLR9|MYD88|PI3K|MAPK|ERK|BCR|PD1|PD-1|IFN", fgsea_consolidated$pathway))
+
+```
+
+
+
+
+```{r enrichment_map_functions}
+
+
+compute_modules_func_ledge <- function(fgsea_output, 
+                                       padj_threshold = 0.05,
+                                       jaccard_threshold = 0.5, 
+                                       filename,
+                                       p_integration_method = "maxp") {
+  
+  
+  pathDF <- as.data.frame(fgsea_output) %>% 
+          filter(padj < padj_threshold) 
+  #### enrichment map
+  # define nes (1 or -1)
+  nes = 1
+  nes_check <- FALSE
+  outGS_list <- c()
+  while(nes_check == FALSE){
+    if(nes == -1) {
+      leDF <- pathDF %>% dplyr::filter(NES < 0)
+    } else {
+      leDF <- pathDF %>% dplyr::filter(NES > 0)
+    }
+    
+    leLS <- sapply(leDF$pathway, simplify = F, USE.NAMES = T, function(x){
+          le <- leDF %>% filter(pathway == x) %>%
+            separate_rows(leadingEdge, sep = ", ") %>%
+            .$leadingEdge
+      return(le)
+    })
+    
+    # calculate Jaccard index
+      gsDist <- sapply(leLS, function(gs1) {
+        gsDist <- sapply(leLS, function(gs2) {
+                    gs1 <- gs1
+                    gs2 <- gs2
+                    jaccardIndex <- length(intersect(gs1, gs2))
+                    jaccardIndex <- jaccardIndex /
+                                    (length(gs1) + length(gs2) - jaccardIndex)
+        return(value = jaccardIndex)
+      })
+        return(value = gsDist)
+    })
+      
+    # filter based on jaccard threshold
+    gsMin <- gsDist
+    gsMin[gsMin < jaccard_threshold] <- 0
+    
+    # remove all singletons
+    flag <- rowSums(gsMin) > 1 | colSums(gsMin) > 1
+    gsFilt <- gsMin[flag, flag]
+
+    # create graph
+    g <- graph.adjacency(gsFilt,
+                         mode = "undirected",
+                         weighted = TRUE,
+                         diag = FALSE)
+    # decompose graph into modules and find most frequent genes of each module
+    gD <- decompose(g)
+
+     outNet <- lapply(1:length(gD), FUN = function(i) {
+      gsName <- V(gD[[i]])$"name"
+      geneFreq <- sort(table(unlist(leLS[gsName])))
+      
+      #geneFreq <- geneFreq[geneFreq >1]
+      if(length(gsName <= 4)) {
+        geneFreq <- geneFreq[geneFreq > 1/2 * length(gsName)]
+      } else {
+        geneFreq <- geneFreq[geneFreq > 1/4 * length(gsName)]
+      }
+      geneFreq <- geneFreq[order(geneFreq, decreasing = TRUE)]
+     
+      #return()
+      topGS <- gsName
+      #print(geneFreq)
+      
+      
+      df <- data.frame(gs = paste(topGS, collapse = ", "),
+               genes = paste(names(geneFreq), collapse = ", "),
+               freq  = paste(geneFreq, collapse = ", ")) #%>%
+      
+      return(df)
+      #return(topGS)
+    }) 
+    # outNet <- do.call(what = rbind, outNet)
+    outGS_list <- c(outGS_list,outNet)
+    if(nes == -1){
+      nes_check <- TRUE
+    }
+    nes <- -1
+    }
+
+      pval_int <- function(df, integ_method){
+        if(integ_method == "maxp"){
+          df %>% mutate(pval_int = max(pval))  %>%
+                mutate(logp = -log(pval_int) * sign(NES)) %>%
+                  mutate(NES_int = max(abs(NES)) * sign(NES))
+            
+        } else if( integ_method == "minp"){
+          df %>% mutate(pval_int = min(pval)) %>%
+                mutate(logp = -log(pval_int) * sign(NES)) %>%
+                  mutate(NES_int = min(abs(NES)) * sign(NES))
+        }
+      }
+    #   outGS_list <- c(outGS_list,gsDist)
+    #if(nes == -1){
+      #outNet <- outGS_list
+      out <- do.call(what = rbind, outGS_list) %>%
+                rowid_to_column("rowid") %>%
+                mutate(module = paste("MODULE", rowid, sep = "_")) %>%
+                mutate(module_newName = "") %>%
+                dplyr::select(module_newName, module, gs, genes) %>%
+          
+                mutate(gsSplit = gs) %>%
+                separate_rows(gsSplit, sep = ", ") %>%
+                inner_join(., pathDF %>% dplyr::select(pathway, NES, pval), 
+                           by = c("gsSplit" = "pathway")) %>%
+                group_by(module) %>%
+                pval_int(., integ_method = p_integration_method) %>%
+                # mutate(NES_int = ifelse(pval == pval_int, NES, NA )) %>%
+                # filter(!is.na(NES_int)) %>%
+                unique() %>%
+                dplyr::select(module_newName, module, gs, genes, pval_int, logp, NES_int) %>%
+                dplyr::rename(NES = 'NES_int') %>%
+
+                unique() %>%
+                ungroup()
+    
+
+  return(out)
+}
+
+
+substitute_modules <- function(fgsea_table, module_table){
+  module_delete <- module_table %>%
+                    separate_rows(gs, sep = ", ") 
+  module_annex <- module_table %>%
+                    mutate(module = ifelse(module_newName != "", module_newName, module)) %>%
+                    rename(pathway = "module",
+                           pval = "pval_int",
+                           leadingEdge = "genes") %>%
+                    dplyr::select(pathway, pval, logp, NES, leadingEdge)
+  df <- fgsea_table %>%
+          ungroup(.) %>%
+          filter(!pathway %in% module_delete$gs) %>%
+          mutate(logp = -log(pval) * sign(NES)) %>%
+          dplyr::select(pathway, pval, logp, NES, leadingEdge) %>%
+          bind_rows(module_annex) %>%
+          arrange(desc(abs(logp)))
+  return(df)
+}
+
+
+
+
+```
+
+```{r eset_rld_combat}
+
+
+modcombat = model.matrix(~ condition, data=pData(eset_rld))
+
+exprs_corr <- ComBat(exprs(eset_rld), batch = pData(eset_rld)$Patient_ID, mod = modcombat)
+
+eset_rld_combat <- eset_rld
+exprs(eset_rld_combat) <- exprs_corr
+
+
+
+
+```
+
+
+
+
+```{r enMap}
+
+
+functional_gsea <- fgsea_consolidated %>%
+                    filter(gsColl %in% c("c2", "c5", "c7", "hallmark")) %>%
+                    filter(padj < 0.05)
+
+functional_gsea <- fgsea_consolidated %>%
+                    filter(gsColl %in% c("c2", "hallmark")) %>%
+                    filter(padj < 0.05)
+
+
+enMap2_all_05 <- compute_modules_func_ledge(fgsea_output = functional_gsea,
+                                        jaccard_threshold = 0.5)
+
+writexl::write_xlsx(enMap2_all_05, path = "output/data/enMap_all_0.5.xlsx" )
+
+enMap_filt <- read_xlsx(path = "output/data/enMap_all_0.5_UPD_anp.xlsx") %>%
+              filter(module_newName != "") %>%
+              group_by(module_newName) %>%
+              mutate(logp_max = max(logp),
+                      NES_max = max(NES),
+                     minp = min(pval_int)) %>%
+              ungroup() %>%
+              dplyr::select(module_newName, logp_max, minp, NES_max, genes) %>%
+              dplyr::rename(NES = "NES_max",
+                            logp = "logp_max",
+                            pval_int = "minp") %>%
+              separate_rows(genes, sep = ", ") %>%
+              unique() %>%
+              group_by(module_newName) %>%
+              mutate(genes_concat = paste(genes, collapse = ", ")) %>%
+              ungroup() %>%
+              dplyr::select(-genes) %>%
+              unique() %>%
+              dplyr::rename(genes = "genes_concat")
+
+
+pd1_genes <- enMap_filt %>% 
+              filter(module_newName == "PD1 SIGNALING") %>%
+              separate_rows(genes, sep = ", ") %>%
+              .$genes
+
+apoptosis_genes <- enMap_filt %>% 
+              filter(grepl("APOPTOSIS", module_newName)) %>%
+              separate_rows(genes, sep = ", ") %>%
+              .$genes %>% unique()
+
+PD1_module_hm <- DEG_heatmap(eset_rld_combat[pd1_genes,],
+                              heatmap_attributes = list(annotation_col = pData(eset_rld)[c("Condition")],
+                                        show_rownames = T,
+                                        #clustering_distance_cols = "correlation",
+                                        annotation_colors = list("Condition" = color_annots),
+                                        clustering_method = "ward.D",
+                                        show_colnames = F,
+                                        cutree_cols = 2,
+                                        cellheight = 9,
+                                        cellwidth = 12,
+                                        fontsize = 7,
+                                        #cutree_rows = 2,
+                                        filename = file.path(figureDir, "PD1_module_hm.pdf"))    )
+
+LN_signature <- fgsea_consolidated %>%
+                filter(grepl("GSE21029", gsColl)) %>%
+                separate_rows(leadingEdge, sep = ", ")
+
+LN_module_hm <- DEG_heatmap(eset_rld_combat[LN_signature$leadingEdge,],
+                              heatmap_attributes = list(annotation_col = pData(eset_rld_combat)[c("Condition")],
+                                        show_rownames = T,
+                                        annotation_colors = list("Condition" = color_annots),
+                                        #clustering_distance_cols = "correlation",
+                                        clustering_method = "ward.D",
+                                        show_colnames = F,
+                                        cutree_cols = 2,
+                                        treeheight_col = 25,
+                                        cellheight = 9,
+                                        cellwidth = 12,
+                                        fontsize = 7,
+                                        name = "Z-Score"))
+
+pdf("output/figures/LN_module_hm.pdf")
+print(LN_module_hm)
+dev.off()
+
+
+lapply(enMap_filt$module_newName, function(x){
+    ledge <- enMap_filt %>%
+          filter(module_newName == x) %>%
+          separate_rows(genes, sep = ", ") %>%
+          mutate(pathway = gsub("/","_", module_newName)) 
+ 
+    combn_genes <- as.data.frame(t(combn(unique(ledge$genes), m = 2))) %>%
+                    dplyr::rename(source = 1,
+                                  target = 2)
+
+    dir <- sign(unique(ledge$NES))
+    network <- graph_from_data_frame(d=combn_genes, directed=F) 
+    
+    if(dir == 1){
+      V(network)$color <-  rep(color_annots[["PD-1 high"]], length(ledge$genes))
+    } else {
+      V(network)$color <-  rep(color_annots[["PD-1 negative"]], length(ledge$genes))
+    }
+    
+    #layout <- layout_(network, layout_with_kk())
+    node.size <- rep(5, length(ledge$genes))
+    names(node.size) <- ledge$genes
+    # plot it
+    pdf(file.path(figureDir, "gsea_leadingedge", paste(unique(ledge$pathway), "_network.pdf", sep = "")))
+    plot(network, layout = layout_with_kk, vertex.size = node.size, edge.arrow.size=0.01, vertex.label.cex=0.5)
+    title(x)
+    dev.off()
+    
+    hm <- DEG_heatmap(eset_rld_combat[unique(ledge$genes),],
+                              heatmap_attributes = list(annotation_col = pData(eset_rld_combat)[c("Condition")],
+                                        show_rownames = T,
+                                        annotation_colors = list("Condition" = color_annots),
+                                        clustering_method = "ward.D",
+                                        show_colnames = F,
+                                        cutree_cols = 2,
+                                        cellheight = 6,
+                                        cellwidth = 12,
+                                        fontsize = 5,
+                                        name = "Z-Score"
+                                        #cutree_rows = 2,
+                                         ))
+  pdf(file.path(figureDir, "gsea_leadingedge", paste(unique(ledge$pathway), ".pdf", sep = "")), height = 11)
+  print(hm)
+  dev.off()
+
+})
+
+apoptosis_module_hm <- DEG_heatmap(eset_rld_combat[apoptosis_genes,],
+                              heatmap_attributes = list(annotation_col = pData(eset_rld)[c("condition",
+                                                                            "FISH", "IGHV", "Patient_ID")],
+                                        show_rownames = T,
+                                        #clustering_distance_cols = "correlation",
+                                        clustering_method = "ward.D",
+                                        show_colnames = F,
+                                        cutree_cols = 2,
+                                        cellheight = 9,
+                                        cellwidth = 12,
+                                        fontsize = 7,
+                                        #cutree_rows = 2,
+                                        filename = file.path(figureDir, "apoptosis_modules_hm.pdf"))    )
+
+
+
+```
+
+
+
+```{r gsva}
+  module_matrix <- do.call("rbind", lapply(unique(enMap_filt$module_newName), function(k){
+      ledge <- enMap_filt[enMap_filt$module_newName == k,] %>%
+            separate_rows(genes, sep = ", ") %>%
+            .$genes %>% unique()
+      gs <- GeneSetCollection(GeneSet(setName = k, shortDescription = k, geneIds =ledge))
+      mat <- exprs(eset_rld_combat)
+      mat <- mat[ledge,]
+      slea <- as.data.frame(gsva(mat, gset.idx.list = gs, method = "zscore")) %>%
+              rownames_to_column("module") %>%
+              gather(SampleID, zscore, -module)
+  
+  
+})) %>%
+  group_by(module) %>%
+  mutate(zscore = scale(zscore)) %>%
+  ungroup() %>%
+  spread(SampleID, zscore) %>%
+  column_to_rownames("module") %>%
+  as.matrix()
+
+
+ module_matrix_LFC <- do.call("rbind", lapply(unique(enMap_filt$module_newName), function(k){
+      ledge <- enMap_filt[enMap_filt$module_newName == k,] %>%
+            separate_rows(genes, sep = ", ") %>%
+            .$genes %>% unique()
+      
+      # gs <- GeneSetCollection(GeneSet(setName = k, shortDescription = k, geneIds =ledge))
+      mat_raw <- as.data.frame(exprs(eset_rld_combat)) %>%
+                rownames_to_column("gene") %>%
+                filter(gene %in% ledge) %>%
+                gather(Sample, value, -gene) %>%
+                inner_join(., pData(eset_rld) %>%
+                             rownames_to_column("Sample"), by = "Sample") %>%
+                mutate(PID_gene = paste(Patient_ID, gene, sep = "__"))
+      
+      mat_low <- mat_raw[mat_raw$Condition == "PD-1 negative",] %>%
+                  dplyr::rename(low_value = "value") %>%
+                  dplyr::select(PID_gene, low_value)
+      
+      mat <- mat_raw[mat_raw$Condition == "PD-1 high",] %>%
+              inner_join(., mat_low, by = "PID_gene") %>%
+              mutate(logFC = value - low_value) %>%
+              group_by(Sample) %>%
+              summarise(mean = mean(logFC)) %>%
+              ungroup() %>%
+              mutate(module =k)
+                
+      # mat <- mat[ledge,]
+      # slea <- as.data.frame(gsva(mat, gset.idx.list = gs, method = "zscore")) %>%
+      #         rownames_to_column("module") %>%
+      #         gather(SampleID, zscore, -module)
+      # 
+  
+})) %>%
+  #group_by(module) %>%
+  #mutate(zscore = scale(zscore)) %>%
+  #ungroup() %>%
+  spread(Sample, mean) %>%
+  column_to_rownames("module") %>%
+  as.matrix()
+
+
+
+
+module_matrix <- module_matrix[,sampleNames(eset_rld_combat)]
+
+
+
+eset_modules <- ExpressionSet(assayData = module_matrix, 
+              phenoData = AnnotatedDataFrame(pData(eset_rld_combat)))
+
+eset_modules_LFC <- ExpressionSet(assayData = module_matrix_LFC, 
+              phenoData = AnnotatedDataFrame(pData(eset_rld_combat)[colnames(module_matrix_LFC),]))
+
+module_hm <- DEG_heatmap(eset_modules,
+                      heatmap_attributes = list(annotation_col = pData(eset_modules)[c("Condition")],
+                                show_rownames = T,
+                                #clustering_distance_cols = "correlation",
+                                annotation_colors = list("Condition" = color_annots),
+                                clustering_method = "ward.D",
+                                cluster_rows = F,
+                                show_colnames = F,
+                                cutree_cols = 2,
+                                cellheight = 9,
+                                cellwidth = 10,
+                                fontsize = 7,
+                                treeheight_col = 12,
+                                name = "Z-Score",
+                                #cutree_rows = 2,
+                                filename = file.path(figureDir, "all_modules_PD1_hm.pdf"))    )
+
+pdf(file.path(figureDir, "all_modules_PD1_hm.pdf")) 
+module_hm
+dev.off()
+
+module_LFC_hm <- DEG_heatmap(eset_modules_LFC,
+                             scale = F,
+                      heatmap_attributes = list(annotation_col = pData(eset_modules_LFC)[c("FISH", "IGHV", "Patient_ID")],
+                                show_rownames = T,
+                                color = colorAssign(c(0,
+                                                    max(abs(module_matrix_LFC))), 
+                                                    colors = c("white", "red"), 
+                                                    scale_limits = c(0,max(abs(module_matrix_LFC)) ) ),
+                                #clustering_distance_cols = "correlation",
+                                scale = "none",
+                                clustering_method = "ward.D2",
+                                cluster_rows = F,
+                                show_colnames = F,
+                                cellheight = 9,
+                                cellwidth = 12,
+                                fontsize = 7,
+                                #cutree_rows = 2,
+                                filename = file.path(figureDir, "all_modules_PD1_LFC_hm.pdf"))    )
+
+
+
+enMap_filt_no_PD <- enMap_filt[enMap_filt$module_newName != "PD1 SIGNALING",]
+
+pd1_functional_interaction <- do.call("rbind", lapply(enMap2_all_05$module, function(x){
+    df <- enMap2_all_05 %>%
+              filter(module == x) %>%
+              separate_rows(genes, sep = ", ") 
+      over <- length(intersect(df$genes, pd1_genes)) / length(pd1_genes)
+      out <- return(data.frame("module" = x, "overlap" = over))
+  
+}))    %>% arrange(desc(overlap))
+
+
+```
+
+
+```{r fc_matrix}
+
+
+
+
+```
+
+
+```{r CHEA gsva}
+
+gene_level_fpkm <- fpkm_mat %>%
+                    as.data.frame() %>%
+                    rownames_to_column("Gene") %>%
+                    gather(Sample, fpkm, -Gene) %>%
+                    group_by(Gene) %>%
+                    summarise(maxFPKM = max(fpkm)) %>%
+                    ungroup() %>%
+                    filter(maxFPKM > 0.1)
+
+chea_tfs <- fgsea_consolidated %>%
+            filter(padj < 0.001) %>%
+            filter(gsColl == "CHEA") %>%
+            inner_join(., gene_level_fpkm, by = c("pathway" = "Gene")) %>%
+            mutate(logp = -log10(padj) * sign(NES)) %>%
+            arrange(NES)
+chea_tfs$pathway <- factor(chea_tfs$pathway, levels = chea_tfs$pathway)
+
+chea_barchart <- ggplot(chea_tfs, aes(x= pathway, y= NES, label="-log10(p')"))  +
+           geom_bar(stat='identity', width=.5, position = "identity") +
+           labs(x="Pathway", y= "NES") +
+           theme_bw() + 
+           theme(axis.title = element_text(family = journal_font, face="bold", size=12)) +
+           theme(axis.text = element_text(family = journal_font, face="bold", size=8)) +
+          #scale_fill_manual(values = colorpalette, limits=names(colorpalette)) +
+          geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+           coord_flip()
+pdf("output/figures/CHEA_barchart.pdf")
+chea_barchart
+dev.off()
+
+
+chea_dotplot <- ggplot(chea_tfs, aes(y= pathway, x= NES, label="-log10(p')"))  +
+           geom_point(aes(size = size), color = "#FF0000" ) +
+           labs(y="Pathway", x= "NES (Normalized Enrichment Score)") +
+           theme_bw() + 
+           xlim(0, ceiling(max(chea_tfs$NES))) +
+           theme(axis.title = element_text(family = journal_font, face="bold", size=12)) +
+           theme(axis.text = element_text(family = journal_font, face="bold", size=8)) +
+          #scale_fill_manual(values = colorpalette, limits=names(colorpalette)) +
+          geom_vline(xintercept = 0, linetype = "dashed", color = "black") #+
+           #coord_flip()
+pdf("output/figures/CHEA_dotplot.pdf")
+chea_dotplot
+dev.off()
+
+
+
+
+chea_matrix <- do.call("rbind", lapply(unique(chea_tfs$pathway), function(k){
+      ledge <- chea_tfs[chea_tfs$pathway == k,] %>%
+            separate_rows(leadingEdge, sep = ", ") %>%
+            .$leadingEdge %>% unique()
+      gs <- GeneSetCollection(GeneSet(setName = k, shortDescription = k, geneIds = ledge))
+      mat <- exprs(eset_rld_combat)
+      mat <- mat[ledge,]
+      slea <- as.data.frame(gsva(mat, gset.idx.list = gs, method = "zscore")) %>%
+              rownames_to_column("module") %>%
+              gather(SampleID, zscore, -module)
+  
+  
+})) %>%
+  group_by(module) %>%
+  mutate(zscore = scale(zscore)) %>%
+  ungroup() %>%
+  spread(SampleID, zscore) %>%
+  column_to_rownames("module") %>%
+  as.matrix()
+
+chea_matrix <- chea_matrix[,sampleNames(eset_rld_combat)]
+
+eset_chea <- ExpressionSet(assayData = chea_matrix, 
+              phenoData = AnnotatedDataFrame(pData(eset_rld_combat)))
+
+chea_hm <- DEG_heatmap(eset_chea,
+                      heatmap_attributes = list(annotation_col = pData(eset_chea)[c("condition",
+                                                                    "FISH", "IGHV", "Patient_ID")],
+                                show_rownames = T,
+                                #clustering_distance_cols = "correlation",
+                                clustering_method = "ward.D",
+                                cluster_rows = F,
+                                show_colnames = F,
+                                cutree_cols = 2,
+                                cellheight = 9,
+                                cellwidth = 12,
+                                fontsize = 7,
+                                #cutree_rows = 2,
+                                filename = file.path(figureDir, "CHEA_signatures_PD1_hm.pdf"))    )
+
+
+tf_PD1_interaction <- do.call("rbind", lapply(chea_tfs$pathway, function(x){
+      df <- chea_tfs %>%
+              filter(pathway == x) %>%
+              separate_rows(leadingEdge, sep = ", ") 
+      over <- length(intersect(df$leadingEdge, pd1_genes)) / length(pd1_genes)
+      out <- return(data.frame("TF" = x, "overlap" = over))
+  
+})) %>% arrange(desc(overlap))
+
+
+tf_pd1_target <- chea_tfs %>% 
+              separate_rows(leadingEdge, sep = ", ") %>% 
+              filter(leadingEdge == "PDCD1") %>%
+              mutate(logp = -log10(pval) * sign(NES))
+
+tf_egr1_target <- chea_tfs %>% 
+              separate_rows(leadingEdge, sep = ", ") %>% 
+              filter(leadingEdge %in% c("EGR1", "SMAD3", "SMAD4", "TGFBR1")) %>%
+              mutate(logp = -log10(pval) * sign(NES))
+
+egr1_targets <- chea_tfs %>% 
+              dplyr::filter(pathway == "EGR1") %>%
+              separate_rows(leadingEdge, sep = ", ") %>% 
+              filter(leadingEdge %in% selected_degs) 
+
+
+
+chea_PD1_target_hm <- DEG_heatmap(eset_chea[tf_pd1_target$pathway],
+                      heatmap_attributes = list(annotation_col = pData(eset_chea)[c("condition",
+                                                                    "FISH", "IGHV")],
+                                show_rownames = T,
+                                #clustering_distance_cols = "correlation",
+                                clustering_method = "ward.D",
+                                cluster_rows = F,
+                                show_colnames = F,
+                                cutree_cols = 2,
+                                cellheight = 9,
+                                cellwidth = 12,
+                                fontsize = 7,
+                                #cutree_rows = 2,
+                                filename = file.path(figureDir, "CHEA_signatures_PD1_TARGET_hm.pdf"))    )
+
+journal_font <- "Helvetica"
+chea_pd1_tf_barchart <- ggplot(tf_pd1_target, aes(x= pathway, y= NES, label="-log10(p')"))  +
+           geom_bar(stat='identity', width=.5, position = "identity") +
+           labs(x="Pathway", y= "-log10(p')") +
+           theme_bw() + 
+           theme(axis.title = element_text(family = journal_font, face="bold", size=12)) +
+           theme(axis.text = element_text(family = journal_font, face="bold", size=8)) +
+          #scale_fill_manual(values = colorpalette, limits=names(colorpalette)) +
+          geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+           coord_flip()
+pdf("output/figures/CHEA_PD1_targets_barchart.pdf")
+chea_pd1_tf_barchart
+dev.off()
+
+```
+
+```{r test}
+
+compute_jaccard_network <- function(input,  padj_threshold = 0.05, jaccard_threshold = 0) {
+  
+  
+  pathDF <- as.data.frame(input) %>% 
+          filter(padj < padj_threshold) 
+  #### enrichment map
+  # define nes (1 or -1)
+  #nes = 1
+  #nes_check <- FALSE
+  #outGS_list <- c()
+  #while(nes_check == FALSE){
+    # if(nes == -1) {
+    #   leDF <- pathDF %>% dplyr::filter(NES < 0)
+    # } else {
+    #   leDF <- pathDF %>% dplyr::filter(NES > 0)
+    # }
+    leDF <- pathDF
+    leLS <- sapply(leDF$pathway, simplify = F, USE.NAMES = T, function(x){
+          le <- leDF %>% filter(pathway == x) %>%
+            separate_rows(leadingEdge, sep = ", ") %>%
+            .$leadingEdge
+      return(le)
+    })
+    
+    # calculate Jaccard index
+      gsDist <- sapply(leLS, function(gs1) {
+        gsDist <- sapply(leLS, function(gs2) {
+                    gs1 <- gs1
+                    gs2 <- gs2
+                    jaccardIndex <- length(intersect(gs1, gs2))
+                    jaccardIndex <- jaccardIndex /
+                                    (length(gs1) + length(gs2) - jaccardIndex)
+        return(value = jaccardIndex)
+      })
+        return(value = gsDist)
+    })
+      #return(gsDist)
+      
+    
+    network_table <- gsDist %>%
+                    as.data.frame() %>%
+                    rownames_to_column("source") %>%
+                    gather(target, jaccard, -source) %>%
+                    filter(source != target) %>%
+                    filter(jaccard > jaccard_threshold) 
+}
+
+
+enMap_formatted <- enMap_filt %>%
+                    dplyr::rename(pathway = "module_newName",
+                                  leadingEdge = "genes",
+                                  padj = "pval_int") %>%
+                    dplyr::select(pathway, padj, leadingEdge, logp) %>%
+                    mutate(node_type = "functional") %>%
+                    bind_rows(chea_tfs %>%
+                                filter(gsColl == "CHEA") %>%
+                                mutate(logp = -log10(pval) * sign(NES)) %>%
+                                dplyr::select(pathway, padj, leadingEdge, logp) %>%
+                                mutate(node_type = "TF"))
+
+jaccard_dist_modules <- compute_jaccard_network(input = enMap_formatted, jaccard_threshold = 0.025) 
+
+
+possible_combos <- unlist(lapply(combn(x = unique(c(jaccard_dist_modules$source, jaccard_dist_modules$target)), m = 2, simplify = F), function(x){
+                      return(paste(x[1], x[2], sep = "__"))
+}))
+
+
+
+combined_gsva <- rbind(as.data.frame(module_matrix), as.data.frame(chea_matrix[,colnames(module_matrix)]))
+
+gsva_corr <- rcorr(t(as.matrix(combined_gsva)), type = "spearman")
+
+gsva_corr_table <- as.data.frame(gsva_corr$r) %>%
+                    rownames_to_column("col1") %>%
+                    gather(col2, rho, -col1) %>%
+                    mutate(combo = paste(col1, col2, sep = "__")) %>%
+                    inner_join(., as.data.frame(gsva_corr$P) %>%
+                                  rownames_to_column("col1") %>%
+                                  gather(col2, pvalue, -col1) %>%
+                                  mutate(combo = paste(col1, col2, sep = "__")) %>%
+                                  dplyr::select(-col1, -col2)) %>%
+                    filter(!is.na(pvalue)) %>%
+                    dplyr::select(combo, rho, pvalue) %>%
+                    mutate(logp_corr = -log10(pvalue) * sign(rho))
+
+
+jaccard_dist_modules_filt <- jaccard_dist_modules %>%
+                              mutate(TF_TF = ifelse(source %in% enMap_formatted[enMap_formatted$node_type == "TF",]$pathway &
+                                                     target %in% enMap_formatted[enMap_formatted$node_type == "TF",]$pathway,1, 0  )) %>%
+                              filter(TF_TF == 0) %>%
+                              mutate(combo = paste(source, target, sep = "__")) %>%
+                              filter(combo %in% possible_combos) #%>%
+                              #left_join(., gsva_corr_table, by = "combo")
+write_tsv(jaccard_dist_modules_filt, file = "output/data/jaccard_network_table.tsv")
+
+jaccard_node_table <- enMap_formatted %>%
+                      filter(pathway %in% c(jaccard_dist_modules_filt$source , jaccard_dist_modules_filt$target)) %>%
+                      dplyr::select(pathway, logp, node_type) %>%
+                      dplyr::rename(node = "pathway") %>%
+                      left_join(., fgsea_ma %>% dplyr::select(pathway, NES) %>%
+                                      dplyr::rename(NES_microarray = NES), by = c("node" = "pathway")) %>%
+                      mutate(NES_microarray = ifelse(is.na(NES_microarray), 0, NES_microarray))
+                      
+
+                      
+write_tsv(jaccard_node_table, file = "output/data/jaccard_node_table.tsv")
+                        
+
+```
+
+```{r protprot_int_network_func}
+
+string_info <- read_tsv("~/Documents/StringDB/HomoSapiens/9606.protein.info.v11.5.txt") %>% dplyr::rename(protein_id = 1)
+
+stringdf_filter <- c(chea_tfs$pathway, "PDCD1", "PTPN11", "PIK3CA", "PTEN", "ERK1", "ERK2", "PLCG2", "SYK" )
+
+string_links_raw <- read.table("~/Documents/StringDB/HomoSapiens/9606.protein.links.detailed.v11.5.txt", sep = " ", header = T) %>%
+                     gather(type, score, -protein1, -protein2) %>%
+                     filter(type %in% c("coexpression", "experimental", "database")) %>%
+                    inner_join(., string_info %>% dplyr::select(protein_id,preferred_name ), by = c("protein1" = "protein_id")) %>%
+                    dplyr::select(-protein1) %>%
+                    dplyr::rename(gene1 = "preferred_name") %>%
+                    inner_join(., string_info %>% dplyr::select(protein_id,preferred_name ), by = c("protein2" = "protein_id")) %>%
+                      dplyr::select(-protein2) %>%
+                    dplyr::rename(gene2 = "preferred_name") %>%
+                    filter(gene1 %in% stringdf_filter & gene2 %in% stringdf_filter)
+
+
+
+
+
+string_combn <- unlist(lapply(combn(unique(unique(string_links_raw$gene1, string_links_raw$gene2)), m = 2, simplify = F), function(x){
+  return(paste(x[1], x[2], sep ="__"))
+}))
+
+
+string_links_filt <- string_links_raw %>%
+                     mutate(combn = paste(gene1, gene2, sep = "__")) %>%
+                     filter(combn %in% string_combn) %>%
+                      dplyr::select(-combn) %>%
+                     group_by(gene1, gene2) %>%
+                     mutate(combined_score = sum(score)) %>%
+                      ungroup() %>%
+                     filter(combined_score > 0) %>%
+                     group_by(type) %>%
+                     mutate(max = max(score)) %>%
+                     ungroup() %>%
+                     mutate(relative_score = score/max) 
+                     
+                         
+string_network_table <- string_links_filt %>%
+                        dplyr::rename(source = "gene1",
+                                      target = "gene2") %>%
+                        dplyr::filter(combined_score > 300) %>%
+                        dplyr::select(source, target, relative_score, type) %>%
+                        filter(relative_score > 0) %>%
+                        bind_rows(chea_tfs %>% 
+                                    separate_rows(leadingEdge, sep = ", ") %>% 
+                                    filter(leadingEdge %in% c(string_links_filt$gene1, string_links_filt$gene2, 
+                                                              "PDCD1", "PTPN11", validation_markers)) %>%
+                                    dplyr::rename(source = "pathway", 
+                                                  target = "leadingEdge") %>%
+                                    dplyr::select(source, target) %>%
+                                    mutate(relative_score = 1,
+                                           type = "TF_target")) %>%
+                        mutate(arrow_target = ifelse(type == "TF_target", "arrow", "no")) 
+
+
+
+string_node_table <- data.frame(node = unique(union(string_network_table$source, string_network_table$target))) %>%
+                      mutate(nodetype = ifelse(node %in% validation_markers, "validation_marker", node)) %>%
+                      mutate(nodetype = ifelse(node %in% chea_tfs$pathway, "TF", nodetype)) %>%
+                      mutate(nodetype = ifelse(node == "PDCD1", "PDCD1", nodetype)) %>%
+                      mutate(nodetype = ifelse(node == "PTPN11", "PTPN11", nodetype)) %>%
+                      mutate(node_type = ifelse(node %in% c("PIK3CA", "PTEN", "ERK1", "ERK2", "PLCG2" ), "SHP2 targets", nodetype)) %>%
+                      inner_join(., gene_level_fpkm, by = c("node" = "Gene")) %>%
+                      mutate(gene_fpkm_log = log(maxFPKM + 1)) 
+
+write_tsv(string_network_table, file = "output/data/string_network_table.tsv")
+write_tsv(string_node_table, file = "output/data/string_node_tabe.tsv")
+
+
+string_network_table_combined <- string_links_filt %>%
+                        dplyr::rename(source = "gene1",
+                                      target = "gene2") %>%
+                        dplyr::filter(combined_score > 300) %>%
+                        gather(type, absolute_score, "combined_score") %>%
+                        dplyr::select(-max, -relative_score) %>%
+                        mutate(relative_score = absolute_score / max(absolute_score)) %>%
+                        dplyr::select(-absolute_score) %>%
+                        dplyr::select(source, target, relative_score, type) %>%
+                        unique() %>%
+                        #filter(relative_score > 0) %>%
+                        bind_rows(chea_tfs %>% 
+                                    separate_rows(leadingEdge, sep = ", ") %>% 
+                                    filter(leadingEdge %in% c(string_links_filt$gene1, string_links_filt$gene2, 
+                                                              "PDCD1", "PTPN11", validation_markers)) %>%
+                                    dplyr::rename(source = "pathway", 
+                                                  target = "leadingEdge") %>%
+                                    dplyr::select(source, target) %>%
+                                    mutate(relative_score = 1,
+                                           type = "TF_target")) %>%
+                        mutate(arrow_target = ifelse(type == "TF_target", "arrow", "no")) 
+
+
+
+string_node_table_combined <- data.frame(node = unique(union(string_network_table_combined$source, string_network_table_combined$target))) %>%
+                      mutate(nodetype = ifelse(node %in% validation_markers, "validation_marker", node)) %>%
+                      mutate(nodetype = ifelse(node %in% chea_tfs$pathway, "TF", nodetype)) %>%
+                      mutate(nodetype = ifelse(node == "PDCD1", "PDCD1", nodetype)) %>%
+                      mutate(nodetype = ifelse(node == "PTPN11", "PTPN11", nodetype)) %>%
+                      mutate(node_type = ifelse(node %in% c("PIK3CA", "PTEN", "ERK1", "ERK2", "PLCG2" ), "SHP2 targets", nodetype)) %>%
+                      inner_join(., gene_level_fpkm, by = c("node" = "Gene")) %>%
+                      mutate(gene_fpkm_log = log(maxFPKM + 1)) 
+
+write_tsv(string_network_table_combined, file = "output/data/string_network_table_combined.tsv")
+write_tsv(string_node_table_combined, file = "output/data/string_node_tabe_combined.tsv")
+
+
+
+string_network_table_combined_functional <- string_links_filt %>%
+                        dplyr::rename(source = "gene1",
+                                      target = "gene2") %>%
+                        dplyr::filter(combined_score > 300) %>%
+                        gather(type, absolute_score, "combined_score") %>%
+                        dplyr::select(-max, -relative_score) %>%
+                        mutate(relative_score = absolute_score / max(absolute_score)) %>%
+                        dplyr::select(-absolute_score) %>%
+                        dplyr::select(source, target, relative_score, type) %>%
+                        unique() %>%
+                        #filter(relative_score > 0) %>%
+                        bind_rows(chea_tfs %>% 
+                                    separate_rows(leadingEdge, sep = ", ") %>% 
+                                    filter(leadingEdge %in% c(string_links_filt$gene1, string_links_filt$gene2, 
+                                                              "PDCD1", "PTPN11", validation_markers)) %>%
+                                    dplyr::rename(source = "pathway", 
+                                                  target = "leadingEdge") %>%
+                                    dplyr::select(source, target) %>%
+                                    mutate(relative_score = 1,
+                                           type = "TF_target")) %>%
+                        mutate(arrow_target = ifelse(type == "TF_target", "arrow", "no")) %>%
+                        mutate(jaccard = 1) %>%
+                        bind_rows(jaccard_dist_modules_filt %>% 
+                                        mutate(relative_score = 1,
+                                               type = "jaccard_index",
+                                               arrow_target = "no") %>% 
+                                        mutate(link_filter = ifelse(source %in% chea_tfs$pathway & target %in% chea_tfs$pathway, 0, 1)) %>%
+                                        mutate(link_filter = ifelse(!source %in% chea_tfs$pathway & !target %in% chea_tfs$pathway, 0, link_filter)) %>%
+                                        filter(link_filter == 1) %>%
+                                        dplyr::select(source, target, relative_score, type, arrow_target, jaccard)) %>%
+                        mutate(jaccard = round(jaccard, digits = 2)) %>%
+                        rowid_to_column("rowid") %>%
+                        arrange(desc(rowid))
+
+
+
+string_node_table_combined_functional <- data.frame(node = unique(union(string_network_table_combined_functional$source,
+                                                                        string_network_table_combined_functional$target))) %>%
+                      mutate(nodetype = ifelse(node %in% validation_markers, "validation_marker", node)) %>%
+                      mutate(nodetype = ifelse(node %in% chea_tfs$pathway, "TF", nodetype)) %>%
+                      mutate(nodetype = ifelse(node == "PDCD1", "PDCD1", nodetype)) %>%
+                      mutate(nodetype = ifelse(node == "PTPN11", "PTPN11", nodetype)) %>%
+                      mutate(nodetype = ifelse(node %in% c("PIK3CA", "PTEN", "ERK1", "ERK2", "PLCG2" ), "SHP2 targets", nodetype)) %>%
+                      mutate(nodetype = ifelse(node %in% enMap_filt$module_newName, "functional_module", nodetype)) #%>%
+                      #inner_join(., gene_level_fpkm, by = c("node" = "Gene")) %>%
+                      #mutate(gene_fpkm_log = log(maxFPKM + 1)) 
+
+write_tsv(string_network_table_combined_functional, file = "output/data/string_network_table_combined_functional.tsv")
+write_tsv(string_node_table_combined_functional, file = "output/data/string_node_tabe_combined_functional.tsv")
+
+
+
+```
+
+
+
+```{r make geneset from modules}
+
+mod_gmt <- GeneSetCollection(lapply(enMap_formatted$pathway, function(x){
+      ledge <- enMap_formatted %>%
+            filter(pathway == x) %>%
+            separate_rows(leadingEdge, sep = ", ") %>%
+            .$leadingEdge
+      out <- GeneSet(setName = x, geneIds = unique(ledge))
+      return(out)
+}))
+
+toGmt(mod_gmt, con = "output/data/module_gmt_PD1.gmt")
+
+
+
+```
+
+
+```{r get BCR_CLL dataset}
+library(GEOquery)
+
+gse <- getGEO("GSE21029", GSEMatrix = TRUE)
+eset_raw <- gse$GSE21029_series_matrix.txt.gz
+```
+
+
+
+```{r mA pDATA}
+
+pData_ma <- pData(eset_raw) %>%
+            rownames_to_column("tmp") %>%
+            dplyr::rename(Patient = "patient:ch1",
+                          Tissue = "origin:ch1") %>%
+            mutate(Patient = gsub(" #", "_", Patient),
+                   Tissue = gsub(" ", "_", Tissue)) %>%
+            column_to_rownames("tmp")
+
+eset <- ExpressionSet(assayData = as.matrix(exprs(eset)),
+                      phenoData = AnnotatedDataFrame(pData_ma),
+                      featureData = AnnotatedDataFrame(fData(eset_raw)))
+
+
+pData(eset) <- AnnotatedDataFrame(pData_ma)
+
+designMat <- model.matrix(~ 0+ Patient + Tissue, data = pData_ma)
+colnames(designMat) <- gsub("Tissue", "", colnames(designMat))
+
+fits <- lmFit(eset,
+             design   = designMat)
+contrastMat <- makeContrasts(contrasts = "Lymph_node-Peripheral_blood", levels = fits$design)
+fit2 <- contrasts.fit(fit = fits, contrasts = contrastMat)
+fit2 <- eBayes(fit = fit2)
+
+
+toptable_ma <- topTable(fit2, coef = 1, n = Inf ) %>%
+          dplyr::select(ID, Gene.Symbol, logFC, AveExpr, t, P.Value, adj.P.Val) %>%
+          filter(!is.na(adj.P.Val)) %>% filter(Gene.Symbol != "") %>%
+          filter(!is.na(t)) %>%
+          separate_rows(Gene.Symbol, sep = " /// ")
+degs_MA <- toptable_ma %>%
+          filter(abs(logFC) > log(1.5) ) %>%
+          filter(adj.P.Val < 0.20) %>%
+          separate_rows(Gene.Symbol, sep = " /// ") %>%
+          filter(Gene.Symbol != "") %>%
+          mutate(direction = ifelse(logFC < 0, "PB", "LN")) %>%
+          split(., f = .$direction)
+
+
+GSE21029_GS<- GeneSetCollection(list(GeneSet(setName = "CLL_LN_vs_Blood_DN", shortDescription = "GSE21029_CLL_LN_vs_Blood", 
+                                             geneIds = unique(degs_MA$PB$Gene.Symbol)),
+                                     GeneSet(setName = "CLL_LN_vs_Blood_UP", shortDescription = "GSE21029_CLL_LN_vs_Blood", 
+                                             geneIds = unique(degs_MA$LN$Gene.Symbol))))
+
+toGmt(GSE21029_GS, con = "output/GSE21029_LN_vs_PB_CLL.gmt")
+```
+
+
+
+```{r lnvsPB gsea}
+
+ranks <- setNames(toptable_ma$t, toptable_ma$Gene.Symbol)
+
+pathways_chea <- gmtPathways("~/Documents/GMT_files/CHEA-tf.gmt")
+fgsea_ma_chea<-fgseaMultilevel(pathways_chea,ranks,minSize=10,maxSize=4000,nPermSimple = 1000) %>%
+          filter(padj < 0.05) %>%
+          #filter(NES > 0) %>%
+          mutate(logp = -log10(padj)) %>%
+          dplyr::filter(pathway %in% chea_tfs$pathway) %>%
+          arrange(NES)
+fgsea_ma_chea$pathway <- factor(fgsea_ma_chea$pathway, levels = fgsea_ma_chea$pathway)
+
+fgsea_ma_chea_barplot <- ggplot(fgsea_ma_chea[fgsea_ma_chea$pathway %in% chea_tfs$pathway,], aes(x= pathway, y= NES))  +
+           geom_bar(stat='identity', width=.5, position = "identity") +
+           labs(x="Pathway", y= "NES") +
+           theme_bw() + 
+           theme(axis.title = element_text(family = journal_font, face="bold", size=12)) +
+           theme(axis.text = element_text(family = journal_font, face="bold", size=8)) +
+          #scale_fill_manual(values = colorpalette, limits=names(colorpalette)) +
+          geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+           coord_flip()
+
+svg("output/figures/LN_PD1_CHEA_modules.svg")
+fgsea_ma_chea_barplot
+dev.off()
+
+ceiling_dec <- function(x, level=1) round(x + 5*10^(-level-1), level)
+
+
+fgsea_ma_chea_dotplot <- ggplot(as.data.frame(fgsea_ma_chea), aes(y= pathway, x= NES, label="-log10(p')"))  +
+           geom_point(aes(size = size), color = "#FF0000" ) +
+           labs(y="Pathway", x= "NES (Normalized Enrichment Score)") +
+           theme_bw() + 
+           xlim(0, ceiling_dec(max(fgsea_ma_chea$NES), level = 2)) +
+           theme(axis.title = element_text(family = journal_font, face="bold", size=12)) +
+           theme(axis.text = element_text(family = journal_font, face="bold", size=8)) +
+          #scale_fill_manual(values = colorpalette, limits=names(colorpalette)) +
+          geom_vline(xintercept = 0, linetype = "dashed", color = "black") #+
+           #coord_flip()
+pdf("output/figures/LN_PD1_modules_CHEA_dotplot.pdf")
+fgsea_ma_chea_dotplot
+dev.off()
+
+
+
+
+
+
+pathways <- gmtPathways("output/data/module_gmt_PD1.gmt")
+fgsea_ma<-fgseaMultilevel(pathways,ranks,minSize=10,maxSize=4000,nPermSimple = 1000) %>%
+          filter(padj < 0.05) %>%
+          filter(!pathway %in% names(pathways_chea)) %>%
+          mutate(logp = -log10(padj)) %>%
+          arrange(NES)
+fgsea_ma$pathway <- factor(fgsea_ma$pathway, levels = fgsea_ma$pathway)
+
+fgsea_ma_barplot <- ggplot(fgsea_ma, aes(x= pathway, y= NES))  +
+           geom_bar(stat='identity', width=.5, position = "identity") +
+           labs(x="Pathway", y= "NES") +
+           theme_bw() + 
+           theme(axis.title = element_text(family = journal_font, face="bold", size=12)) +
+           theme(axis.text = element_text(family = journal_font, face="bold", size=8)) +
+          #scale_fill_manual(values = colorpalette, limits=names(colorpalette)) +
+          geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+           coord_flip()
+svg("output/figures/LN_PD1_modules.svg")
+fgsea_ma_barplot
+dev.off()
+
+
+
+fgsea_ma_dotplot <- ggplot(as.data.frame(fgsea_ma), aes(y= pathway, x= NES, label="-log10(p')"))  +
+           geom_point(aes(size = size), color = "#FF0000" ) +
+           labs(y="Pathway", x= "NES (Normalized Enrichment Score)") +
+           theme_bw() + 
+           xlim(0, ceiling_dec(max(fgsea_ma$NES), level = 2)) +
+           theme(axis.title = element_text(family = journal_font, face="bold", size=12)) +
+           theme(axis.text = element_text(family = journal_font, face="bold", size=8)) +
+          #scale_fill_manual(values = colorpalette, limits=names(colorpalette)) +
+          geom_vline(xintercept = 0, linetype = "dashed", color = "black") #+
+           #coord_flip()
+pdf("output/figures/LN_PD1_modules_dotplot.pdf")
+fgsea_ma_dotplot
+dev.off()
+
+
+pdf("output/figures/PD1_modules_combined_dotplot.pdf", width = 12)
+fgsea_ma_dotplot + fgsea_ma_chea_dotplot
+dev.off()
+
+chea_intercept <- intersect(chea_tfs$pathway, fgsea_ma_chea$pathway)
+
+```
